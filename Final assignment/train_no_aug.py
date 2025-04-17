@@ -36,8 +36,7 @@ from albumentations.pytorch import ToTensorV2
 import numpy as np
 from PIL import Image
 from losses import DiceLoss
-from torch.utils.data import ConcatDataset
-import random
+
 
 # Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -74,56 +73,7 @@ def get_args_parser():
 
     return parser
 
-def get_raw_transform():
-    return A.Compose([
-        A.Resize(256, 256),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2()
-    ])
 
-
-def get_stage1_train_transform():
-    return A.Compose([
-        A.Resize(256, 256),
-        A.OneOf([
-            A.GaussianBlur(blur_limit=5, p=1.0),
-            A.RandomBrightnessContrast(brightness_limit=[-0.2, 0.2], contrast_limit=[-0.2, 0.2], p=1.0),
-            A.ISONoise(color_shift = [0.01, 0.05], intensity=[0.1, 0.3], p=1.0),
-            A.Downscale(scale_range = [0.45, 0.45] ,p=1.0),
-        ], p=1.0),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2()
-    ])
-
-    return A.Compose([
-        A.Resize(256, 256),
-        RandomSomeOf(augmentations, min_n=1, max_n=3, p=1.0),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2(),
-    ], is_check_shapes=False)
-
-
-# Albumentations wrapper for corrupted validation set
-class AlbumentationsWrapper(torch.utils.data.Dataset):
-    def __init__(self, dataset, transform):
-        self.dataset = dataset
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        img, mask = self.dataset[idx]
-
-        # Fix ColorJitter crash: make sure it's RGB
-        if hasattr(img, "convert"):
-            img = img.convert("RGB")
-
-        img = np.array(img)
-        mask = np.array(mask)
-
-        transformed = self.transform(image=img, mask=mask)
-        return transformed["image"], transformed["mask"]
 
 
 def main(args):
@@ -156,23 +106,13 @@ def main(args):
     ])
 
     # Load the dataset and make a split for training and validation
-    train_dataset_raw = Cityscapes(
+    train_dataset = Cityscapes(
         args.data_dir, 
         split="train", 
         mode="fine", 
-        target_type="semantic"
+        target_type="semantic", 
+        transforms=transform
     )
-
-    train_dataset_aug = AlbumentationsWrapper(
-        train_dataset_raw,
-        transform=get_stage1_train_transform()
-    )
-
-    train_dataset_raw = AlbumentationsWrapper(train_dataset_raw, transform=get_raw_transform())
-
-
-    train_dataset = ConcatDataset([train_dataset_raw, train_dataset_aug])
-
     valid_dataset = Cityscapes(
         args.data_dir, 
         split="val", 
@@ -194,6 +134,23 @@ def main(args):
         ToTensorV2(),
     ])
 
+
+    # Albumentations wrapper for corrupted validation set
+    class AlbumentationsWrapper(torch.utils.data.Dataset):
+        def __init__(self, dataset, transform):
+            self.dataset = dataset
+            self.transform = transform
+
+        def __len__(self):
+            return len(self.dataset)
+
+        def __getitem__(self, idx):
+            img, mask = self.dataset[idx]
+            img = np.array(img)
+            mask = np.array(mask)
+            transformed = self.transform(image=img, mask=mask)
+            return transformed["image"], transformed["mask"]
+
     # Unwrapped version of Cityscapes for albumentations
     valid_dataset_corr = Cityscapes(
         args.data_dir,
@@ -203,7 +160,6 @@ def main(args):
     )
 
     corrupted_val_dataset = AlbumentationsWrapper(valid_dataset_corr, corrupted_transform)
-
     corrupted_val_loader = DataLoader(
         corrupted_val_dataset,
         batch_size=args.batch_size,
@@ -212,7 +168,7 @@ def main(args):
     )
 
 
-    # train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
+    train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
     valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
 
     train_dataloader = DataLoader(
@@ -221,7 +177,6 @@ def main(args):
         shuffle=True,
         num_workers=args.num_workers
     )
-
     valid_dataloader = DataLoader(
         valid_dataset, 
         batch_size=args.batch_size, 

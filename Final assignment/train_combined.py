@@ -82,25 +82,51 @@ def get_raw_transform():
     ])
 
 
+def get_stage0_train_transform():
+    return A.Compose([
+        A.Resize(256, 256),
+        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ToTensorV2()
+    ])
+
 def get_stage1_train_transform():
     return A.Compose([
         A.Resize(256, 256),
         A.OneOf([
             A.GaussianBlur(blur_limit=5, p=1.0),
             A.RandomBrightnessContrast(brightness_limit=[-0.2, 0.2], contrast_limit=[-0.2, 0.2], p=1.0),
-            A.ISONoise(color_shift = [0.01, 0.05], intensity=[0.1, 0.3], p=1.0),
-            A.Downscale(scale_range = [0.45, 0.45] ,p=1.0),
+            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.3), p=1.0),
+            A.Downscale(scale_range = [0.45, 0.45], p=1.0),
         ], p=1.0),
         A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2()
+        ToTensorV2(),
     ])
 
+def get_stage2_train_transform():
     return A.Compose([
         A.Resize(256, 256),
-        RandomSomeOf(augmentations, min_n=1, max_n=3, p=1.0),
+        A.OneOf([
+            A.RandomFog(fog_coef_range=(1, 1), alpha_coef=0.2, p=1.0),
+            A.RandomShadow(num_shadows_limit=(2, 3), shadow_dimension=4, shadow_roi=(0, 0.5, 1, 1), p=1),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), src_radius=200, p=1),
+            A.RandomSnow(brightness_coeff=1.3, snow_point_range=(0.3, 0.5), p=1),
+            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, p=1, rain_type="drizzle"),
+        ], p=1.0),
         A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ToTensorV2(),
-    ], is_check_shapes=False)
+    ])
+
+
+def get_train_transform_for_epoch(epoch):
+    if epoch < 25:
+        return get_stage0_train_transform()
+    elif epoch < 60:
+        return get_stage1_train_transform()
+    else:
+        return get_stage2_train_transform()
+
+
+
 
 
 # Albumentations wrapper for corrupted validation set
@@ -163,16 +189,6 @@ def main(args):
         target_type="semantic"
     )
 
-    train_dataset_aug = AlbumentationsWrapper(
-        train_dataset_raw,
-        transform=get_stage1_train_transform()
-    )
-
-    train_dataset_raw = AlbumentationsWrapper(train_dataset_raw, transform=get_raw_transform())
-
-
-    train_dataset = ConcatDataset([train_dataset_raw, train_dataset_aug])
-
     valid_dataset = Cityscapes(
         args.data_dir, 
         split="val", 
@@ -215,12 +231,6 @@ def main(args):
     # train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
     valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
 
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        num_workers=args.num_workers
-    )
 
     valid_dataloader = DataLoader(
         valid_dataset, 
@@ -228,6 +238,7 @@ def main(args):
         shuffle=False,
         num_workers=args.num_workers
     )
+
 
     # Define the model
     model = UNet(
@@ -240,33 +251,51 @@ def main(args):
 
     # Define the optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr)
-
+    global_step = 0
     # Training loop
     best_valid_loss = float('inf')
     current_best_model_path = None
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
-        # Training
+            # Recreate loaders each epoch to reshuffle
+        stage0_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage0_train_transform())
+        stage1_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage1_train_transform())
+        stage2_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage2_train_transform())
+
+        per_stage_batch_size = args.batch_size // 3
+
+        loader0 = DataLoader(stage0_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
+        loader1 = DataLoader(stage1_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
+        loader2 = DataLoader(stage2_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
+
+        train_loader_zipped = zip(loader0, loader1, loader2)
+
+        
+
         model.train()
-        for i, (images, labels) in enumerate(train_dataloader):
 
-            labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
+        for i, ((x0, y0), (x1, y1), (x2, y2)) in enumerate(train_loader_zipped):
+            images = torch.cat([x0, x1, x2], dim=0)
+            labels = torch.cat([y0, y1, y2], dim=0)
+
+            labels = convert_to_train_id(labels)
             images, labels = images.to(device), labels.to(device)
-
-            labels = labels.long().squeeze(1)  # Remove channel dimension
+            labels = labels.long().squeeze(1)
 
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            steps_per_epoch = min(len(loader0), len(loader1), len(loader2))
 
             wandb.log({
                 "train_loss": loss.item(),
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
-            }, step=epoch * len(train_dataloader) + i)
+            }, step=global_step)
+            global_step += 1
             
     # --- Snipped to the start of validation ---
         # Validation
@@ -297,12 +326,12 @@ def main(args):
                     wandb.log({
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
-                    }, step=(epoch + 1) * len(train_dataloader) - 1)
+                    }, step=global_step - 1)
 
             valid_loss = sum(losses) / len(losses)
             wandb.log({
                 "valid_loss": valid_loss
-            }, step=(epoch + 1) * len(train_dataloader) - 1)
+            }, step=global_step-1)
 
             # --- New: Evaluate and log corrupted validation loss ---
             corrupted_losses = []
@@ -328,12 +357,12 @@ def main(args):
                     wandb.log({
                         "corrupted_predictions": [wandb.Image(corr_preds_img)],
                         "corrupted_labels": [wandb.Image(corr_labels_img)],
-                    }, step=(epoch + 1) * len(train_dataloader) - 1)
+                    }, step=global_step - 1)
 
             corrupted_valid_loss = sum(corrupted_losses) / len(corrupted_losses)
             wandb.log({
                 "corrupted_valid_loss": corrupted_valid_loss
-            }, step=(epoch + 1) * len(train_dataloader) - 1)
+            }, step=global_step - 1)
 
             # Save best model checkpoint
             if valid_loss < best_valid_loss:

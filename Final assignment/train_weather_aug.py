@@ -86,10 +86,11 @@ def get_stage1_train_transform():
     return A.Compose([
         A.Resize(256, 256),
         A.OneOf([
-            A.GaussianBlur(blur_limit=5, p=1.0),
-            A.RandomBrightnessContrast(brightness_limit=[-0.2, 0.2], contrast_limit=[-0.2, 0.2], p=1.0),
-            A.ISONoise(color_shift = [0.01, 0.05], intensity=[0.1, 0.3], p=1.0),
-            A.Downscale(scale_range = [0.45, 0.45] ,p=1.0),
+            A.RandomFog(fog_coef_range=(1, 1), alpha_coef=0.2, p=1.0),
+            A.RandomShadow(num_shadows_limit=(2, 3), shadow_dimension=4, shadow_roi=(0, 0.5, 1, 1), p=1),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), src_radius = 200, p=1),
+            A.RandomSnow(brightness_coeff=1.3, snow_point_range=(0.3, 0.5), p=1),
+            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, p=1, rain_type="drizzle"),
         ], p=1.0),
         A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ToTensorV2()
