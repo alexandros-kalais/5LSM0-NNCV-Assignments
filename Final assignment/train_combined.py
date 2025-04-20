@@ -7,7 +7,6 @@ import os
 import random
 import numpy as np
 from argparse import ArgumentParser
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset
@@ -19,9 +18,21 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 import wandb
-
 from unet import UNet
 from losses import DiceLoss
+
+def get_args_parser():
+
+    parser = ArgumentParser("Training script for a PyTorch U-Net model")
+    parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
+    parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
+
+    return parser
 
 # ----------- Utility Functions -----------
 # Mapping class IDs to train IDs
@@ -225,3 +236,4 @@ if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
     main(args)
+    
