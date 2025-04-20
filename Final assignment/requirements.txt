@@ -12,3 +12,4 @@ matplotlib
 seaborn
 wandb
 tqdm
+albumentations
