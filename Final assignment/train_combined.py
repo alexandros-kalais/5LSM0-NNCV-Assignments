@@ -1,91 +1,51 @@
 """
-This script implements a training loop for the model. It is designed to be flexible, 
-allowing you to easily modify hyperparameters using a command-line argument parser.
-
-### Key Features:
-1. **Hyperparameter Tuning:** Adjust hyperparameters by parsing arguments from the `main.sh` script or directly 
-   via the command line.
-2. **Remote Execution Support:** Since this script runs on a server, training progress is not visible on the console. 
-   To address this, we use the `wandb` library for logging and tracking progress and results.
-3. **Encapsulation:** The training loop is encapsulated in a function, enabling it to be called from the main block. 
-   This ensures proper execution when the script is run directly.
-
-Feel free to customize the script as needed for your use case.
+Training script for staged and batch-mixed data augmentation on Cityscapes.
+Tracks performance on both clean and corrupted validation sets using Weights & Biases.
 """
+
 import os
+import random
+import numpy as np
 from argparse import ArgumentParser
 
-import wandb
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
 from torchvision.datasets import Cityscapes, wrap_dataset_for_transforms_v2
 from torchvision.utils import make_grid
-from torchvision.transforms.v2 import (
-    Compose,
-    Normalize,
-    Resize,
-    ToImage,
-    ToDtype,
-)
-
-from unet import UNet
+from torchvision.transforms.v2 import Compose, Normalize, Resize, ToImage, ToDtype
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import numpy as np
 from PIL import Image
-from losses import DiceLoss
-from torch.utils.data import ConcatDataset
-import random
+import wandb
 
+from unet import UNet
+from losses import DiceLoss
+
+# ----------- Utility Functions -----------
 # Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
+train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != 255}
+train_id_to_color[255] = (0, 0, 0)
+
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
     return label_img.apply_(lambda x: id_to_trainid[x])
-
-# Mapping train IDs to color
-train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != 255}
-train_id_to_color[255] = (0, 0, 0)  # Assign black to ignored labels
 
 def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     batch, _, height, width = prediction.shape
     color_image = torch.zeros((batch, 3, height, width), dtype=torch.uint8)
-
     for train_id, color in train_id_to_color.items():
         mask = prediction[:, 0] == train_id
-
         for i in range(3):
             color_image[:, i][mask] = color[i]
-
     return color_image
 
-
-def get_args_parser():
-
-    parser = ArgumentParser("Training script for a PyTorch U-Net model")
-    parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
-    parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
-
-    return parser
-
-def get_raw_transform():
-    return A.Compose([
-        A.Resize(256, 256),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2()
-    ])
-
-
+# ----------- Transformations -----------
 def get_stage0_train_transform():
     return A.Compose([
         A.Resize(256, 256),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.Normalize(mean=(0.5,) * 3, std=(0.5,) * 3),
         ToTensorV2()
     ])
 
@@ -96,10 +56,10 @@ def get_stage1_train_transform():
             A.GaussianBlur(blur_limit=5, p=1.0),
             A.RandomBrightnessContrast(brightness_limit=[-0.2, 0.2], contrast_limit=[-0.2, 0.2], p=1.0),
             A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.3), p=1.0),
-            A.Downscale(scale_range = [0.45, 0.45], p=1.0),
+            A.Downscale(scale_range=[0.45, 0.45], p=1.0),
         ], p=1.0),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2(),
+        A.Normalize(mean=(0.5,) * 3, std=(0.5,) * 3),
+        ToTensorV2()
     ])
 
 def get_stage2_train_transform():
@@ -107,29 +67,16 @@ def get_stage2_train_transform():
         A.Resize(256, 256),
         A.OneOf([
             A.RandomFog(fog_coef_range=(1, 1), alpha_coef=0.2, p=1.0),
-            A.RandomShadow(num_shadows_limit=(2, 3), shadow_dimension=4, shadow_roi=(0, 0.5, 1, 1), p=1),
-            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), src_radius=200, p=1),
-            A.RandomSnow(brightness_coeff=1.3, snow_point_range=(0.3, 0.5), p=1),
-            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, p=1, rain_type="drizzle"),
+            A.RandomShadow(num_shadows_limit=(2, 3), shadow_dimension=4, shadow_roi=(0, 0.5, 1, 1), p=1.0),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), src_radius=200, p=1.0),
+            A.RandomSnow(brightness_coeff=1.3, snow_point_range=(0.3, 0.5), p=1.0),
+            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, rain_type="drizzle", p=1.0),
         ], p=1.0),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2(),
+        A.Normalize(mean=(0.5,) * 3, std=(0.5,) * 3),
+        ToTensorV2()
     ])
 
-
-def get_train_transform_for_epoch(epoch):
-    if epoch < 25:
-        return get_stage0_train_transform()
-    elif epoch < 60:
-        return get_stage1_train_transform()
-    else:
-        return get_stage2_train_transform()
-
-
-
-
-
-# Albumentations wrapper for corrupted validation set
+# Custom dataset wrapper for Albumentations
 class AlbumentationsWrapper(torch.utils.data.Dataset):
     def __init__(self, dataset, transform):
         self.dataset = dataset
@@ -140,141 +87,78 @@ class AlbumentationsWrapper(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img, mask = self.dataset[idx]
-
-        # Fix ColorJitter crash: make sure it's RGB
-        if hasattr(img, "convert"):
-            img = img.convert("RGB")
-
-        img = np.array(img)
+        img = np.array(img.convert("RGB"))
         mask = np.array(mask)
-
         transformed = self.transform(image=img, mask=mask)
         return transformed["image"], transformed["mask"]
 
-
+# ----------- Training Entry Point -----------
 def main(args):
-    # Initialize wandb for logging
     wandb.init(
-        project="5lsm0-cityscapes-segmentation",  # Project name in wandb
-        name=args.experiment_id,  # Experiment name in wandb
-        config=vars(args),  # Save hyperparameters
+        project="5lsm0-cityscapes-segmentation",
+        name=args.experiment_id,
+        config=vars(args)
     )
 
-    # Create output directory if it doesn't exist
     output_dir = os.path.join("checkpoints", args.experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Set seed for reproducability
-    # If you add other sources of randomness (NumPy, Random), 
-    # make sure to set their seeds as well
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
-
-    # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Define the transforms to apply to the data
-    transform = Compose([
-        ToImage(),
-        Resize((256, 256)),
-        ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
-    ])
+    # Dataset loading
+    train_dataset_raw = Cityscapes(args.data_dir, split="train", mode="fine", target_type="semantic")
+    valid_dataset = Cityscapes(args.data_dir, split="val", mode="fine", target_type="semantic",
+                               transforms=Compose([ToImage(), Resize((256, 256)), ToDtype(torch.float32, scale=True), Normalize((0.5,), (0.5,))]))
+    valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
 
-    # Load the dataset and make a split for training and validation
-    train_dataset_raw = Cityscapes(
-        args.data_dir, 
-        split="train", 
-        mode="fine", 
-        target_type="semantic"
-    )
-
-    valid_dataset = Cityscapes(
-        args.data_dir, 
-        split="val", 
-        mode="fine", 
-        target_type="semantic", 
-        transforms=transform
-    )
-
+    # Corrupted validation dataset
     corrupted_transform = A.Compose([
         A.Resize(256, 256),
         A.OneOf([
             A.RandomFog(fog_coef_range=(1, 1), alpha_coef=0.4, p=1.0),
-            A.RandomShadow(num_shadows_limit=(4, 4), shadow_dimension=5, shadow_roi=(0, 0.5, 1, 1), p=1),
-            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), p=1),
-            A.RandomSnow(brightness_coeff=2.5, snow_point_range=(0.3, 0.5), p=1),
-            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, p=1, rain_type="heavy"),
+            A.RandomShadow(num_shadows_limit=(4, 4), shadow_dimension=5, shadow_roi=(0, 0.5, 1, 1), p=1.0),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5), p=1.0),
+            A.RandomSnow(brightness_coeff=2.5, snow_point_range=(0.3, 0.5), p=1.0),
+            A.RandomRain(brightness_coefficient=0.8, drop_width=1, blur_value=5, p=1.0, rain_type="heavy"),
         ], p=1.0),
-        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ToTensorV2(),
+        A.Normalize(mean=(0.5,) * 3, std=(0.5,) * 3),
+        ToTensorV2()
     ])
-
-    # Unwrapped version of Cityscapes for albumentations
-    valid_dataset_corr = Cityscapes(
-        args.data_dir,
-        split="val",
-        mode="fine",
-        target_type="semantic"
+    corrupted_val_dataset = AlbumentationsWrapper(
+        Cityscapes(args.data_dir, split="val", mode="fine", target_type="semantic"),
+        corrupted_transform
     )
 
-    corrupted_val_dataset = AlbumentationsWrapper(valid_dataset_corr, corrupted_transform)
+    corrupted_val_loader = DataLoader(corrupted_val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    corrupted_val_loader = DataLoader(
-        corrupted_val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers
-    )
-
-
-    # train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
-    valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
-
-
-    valid_dataloader = DataLoader(
-        valid_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False,
-        num_workers=args.num_workers
-    )
-
-
-    # Define the model
-    model = UNet(
-        in_channels=3,  # RGB images
-        n_classes=19,  # 19 classes in the Cityscapes dataset
-    ).to(device)
-
-    # Define the loss function
-    criterion = DiceLoss(ignore_index=255)  # Ignore the void class
-
-    # Define the optimizer
+    # Model, loss and optimizer
+    model = UNet(in_channels=3, n_classes=19).to(device)
+    criterion = DiceLoss(ignore_index=255)
     optimizer = AdamW(model.parameters(), lr=args.lr)
-    global_step = 0
-    # Training loop
+
     best_valid_loss = float('inf')
     current_best_model_path = None
+    global_step = 0
+
+    # ----------- Training Loop -----------
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
-            # Recreate loaders each epoch to reshuffle
-        stage0_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage0_train_transform())
-        stage1_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage1_train_transform())
-        stage2_dataset = AlbumentationsWrapper(train_dataset_raw, transform=get_stage2_train_transform())
+        # Create 3 separate augmentations per batch
+        stage0 = AlbumentationsWrapper(train_dataset_raw, transform=get_stage0_train_transform())
+        stage1 = AlbumentationsWrapper(train_dataset_raw, transform=get_stage1_train_transform())
+        stage2 = AlbumentationsWrapper(train_dataset_raw, transform=get_stage2_train_transform())
 
         per_stage_batch_size = args.batch_size // 3
-
-        loader0 = DataLoader(stage0_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
-        loader1 = DataLoader(stage1_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
-        loader2 = DataLoader(stage2_dataset, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
-
+        loader0 = DataLoader(stage0, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
+        loader1 = DataLoader(stage1, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
+        loader2 = DataLoader(stage2, batch_size=per_stage_batch_size, shuffle=True, num_workers=args.num_workers)
         train_loader_zipped = zip(loader0, loader1, loader2)
 
-        
-
         model.train()
-
         for i, ((x0, y0), (x1, y1), (x2, y2)) in enumerate(train_loader_zipped):
             images = torch.cat([x0, x1, x2], dim=0)
             labels = torch.cat([y0, y1, y2], dim=0)
@@ -288,7 +172,6 @@ def main(args):
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            steps_per_epoch = min(len(loader0), len(loader1), len(loader2))
 
             wandb.log({
                 "train_loss": loss.item(),
@@ -296,99 +179,48 @@ def main(args):
                 "epoch": epoch + 1,
             }, step=global_step)
             global_step += 1
-            
-    # --- Snipped to the start of validation ---
-        # Validation
+
+        # ----------- Evaluation Loop -----------
         model.eval()
         with torch.no_grad():
+            # Clean validation
             losses = []
-            for i, (images, labels) in enumerate(valid_dataloader):
-
+            for images, labels in valid_dataloader:
                 labels = convert_to_train_id(labels)
                 images, labels = images.to(device), labels.to(device)
                 labels = labels.long().squeeze(1)
 
                 outputs = model(images)
-                loss = criterion(outputs, labels)
-                losses.append(loss.item())
-
-                if i == 0:
-                    predictions = outputs.softmax(1).argmax(1)
-                    predictions = predictions.unsqueeze(1)
-                    labels = labels.unsqueeze(1)
-
-                    predictions = convert_train_id_to_color(predictions)
-                    labels = convert_train_id_to_color(labels)
-
-                    predictions_img = make_grid(predictions.cpu(), nrow=8).permute(1, 2, 0).numpy()
-                    labels_img = make_grid(labels.cpu(), nrow=8).permute(1, 2, 0).numpy()
-
-                    wandb.log({
-                        "predictions": [wandb.Image(predictions_img)],
-                        "labels": [wandb.Image(labels_img)],
-                    }, step=global_step - 1)
+                losses.append(criterion(outputs, labels).item())
 
             valid_loss = sum(losses) / len(losses)
-            wandb.log({
-                "valid_loss": valid_loss
-            }, step=global_step-1)
+            wandb.log({"valid_loss": valid_loss}, step=global_step-1)
 
-            # --- New: Evaluate and log corrupted validation loss ---
+            # Corrupted validation
             corrupted_losses = []
-            for j, (corr_imgs, corr_labels) in enumerate(corrupted_val_loader):
-                corr_labels = convert_to_train_id(corr_labels)  
-                corr_imgs = corr_imgs.to(device)
-                corr_labels = corr_labels.to(device).long().squeeze(1)
+            for corr_imgs, corr_labels in corrupted_val_loader:
+                corr_labels = convert_to_train_id(corr_labels)
+                corr_imgs, corr_labels = corr_imgs.to(device), corr_labels.to(device).long().squeeze(1)
 
                 corr_outputs = model(corr_imgs)
-                loss = criterion(corr_outputs, corr_labels)
-                corrupted_losses.append(loss.item())
-
-                if j == 0:
-                    corr_preds = corr_outputs.softmax(1).argmax(1).unsqueeze(1)
-                    corr_labels = corr_labels.unsqueeze(1)
-
-                    corr_preds_color = convert_train_id_to_color(corr_preds)
-                    corr_labels_color = convert_train_id_to_color(corr_labels)
-
-                    corr_preds_img = make_grid(corr_preds_color.cpu(), nrow=8).permute(1, 2, 0).numpy()
-                    corr_labels_img = make_grid(corr_labels_color.cpu(), nrow=8).permute(1, 2, 0).numpy()
-
-                    wandb.log({
-                        "corrupted_predictions": [wandb.Image(corr_preds_img)],
-                        "corrupted_labels": [wandb.Image(corr_labels_img)],
-                    }, step=global_step - 1)
+                corrupted_losses.append(criterion(corr_outputs, corr_labels).item())
 
             corrupted_valid_loss = sum(corrupted_losses) / len(corrupted_losses)
-            wandb.log({
-                "corrupted_valid_loss": corrupted_valid_loss
-            }, step=global_step - 1)
+            wandb.log({"corrupted_valid_loss": corrupted_valid_loss}, step=global_step-1)
 
-            # Save best model checkpoint
+            # Save best model
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 if current_best_model_path:
                     os.remove(current_best_model_path)
-                current_best_model_path = os.path.join(
-                    output_dir,
-                    f"best_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth"
-                )
+                current_best_model_path = os.path.join(output_dir, f"best_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth")
                 torch.save(model.state_dict(), current_best_model_path)
 
-        
-    print("Training complete!")
-
-    # Save the model
-    torch.save(
-        model.state_dict(),
-        os.path.join(
-            output_dir,
-            f"final_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth"
-        )
-    )
+    # Save final model
+    torch.save(model.state_dict(), os.path.join(output_dir, f"final_model-epoch={epoch:04}-val_loss={valid_loss:04}.pth"))
     wandb.finish()
 
-
+# ----------- Run -----------
 if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
