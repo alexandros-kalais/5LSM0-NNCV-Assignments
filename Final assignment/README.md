@@ -21,6 +21,7 @@ Here's a brief overview of the files you'll find in this repository:
 - losses.py: Includes the loss functions which can be used to evaluate the model
 - unet.py: Contains the improved model
 - train_combined.py: Conatins the training strategy for the final model
+- evaluate_final.py: Contains the code for quantitative and qualitative evaluation of the mdoels.
 - requirements.txt: Required packages to run the code
 - main.sh: Includes the code for tuning the hyperparameters and run the project.
 
